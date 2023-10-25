@@ -31,7 +31,7 @@ val otelVersion = "1.30.0"
 val otelSnapshotVersion = "1.31.0"
 val otelAlphaVersion = if (!TEST_SNAPSHOTS) "$otelVersion-alpha" else "$otelSnapshotVersion-alpha-SNAPSHOT"
 val otelJavaAgentVersion = if (!TEST_SNAPSHOTS) otelVersion else "$otelSnapshotVersion-SNAPSHOT"
-// All versions below are only used in testing and do not affect the released artifact.
+// All versions below are only used in testing and do not affect the released artifact. //
 
 val DEPENDENCY_BOMS = listOf(
   "com.amazonaws:aws-java-sdk-bom:1.12.554",
