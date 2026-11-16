@@ -19,22 +19,27 @@ import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.common.AttributesBuilder;
 import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.sdk.trace.data.SpanData;
 import java.util.Arrays;
 import java.util.List;
 
 /**
- * Builds the metric attribute set for a span: three base dimensions (span.name, span.kind,
- * status.code), any allowlisted semantic-convention attribute present on the span, and the
- * identity/schema attributes. The allowlist is the low-cardinality subset OTel semconv defines on
- * the corresponding request metrics. It is flat: copy any listed key that is present, regardless of
- * span family.
+ * Builds the metric attribute set for a span: the base dimensions proposed for OTel semantic
+ * conventions (otel.span.kind, otel.status_code, error.type, and Opt-In otel.span.name), any
+ * allowlisted semantic-convention attribute present on the span, and the identity/schema
+ * attributes. The allowlist is the low-cardinality subset OTel semconv defines on the corresponding
+ * request metrics. It is flat: copy any listed key that is present, regardless of span family.
  */
 final class SpanMetricsAttributesBuilder {
 
-  static final AttributeKey<String> SPAN_NAME = AttributeKey.stringKey("span.name");
-  static final AttributeKey<String> SPAN_KIND = AttributeKey.stringKey("span.kind");
-  static final AttributeKey<String> STATUS_CODE = AttributeKey.stringKey("status.code");
+  static final AttributeKey<String> SPAN_NAME = AttributeKey.stringKey("otel.span.name");
+  static final AttributeKey<String> SPAN_KIND = AttributeKey.stringKey("otel.span.kind");
+  static final AttributeKey<String> STATUS_CODE = AttributeKey.stringKey("otel.status_code");
+  static final AttributeKey<String> ERROR_TYPE = AttributeKey.stringKey("error.type");
+
+  // error.type value for failed operations whose span carries no error.type (semconv fallback).
+  static final String ERROR_TYPE_OTHER = "_OTHER";
 
   // Copied when present; a span only carries the keys of its own family, so no family branching.
   // These are the current semconv keys; legacy predecessors are handled by LEGACY_FALLBACKS below.
@@ -129,15 +134,21 @@ final class SpanMetricsAttributesBuilder {
   private static final AttributeKey<Boolean> MESSAGING_DESTINATION_ANONYMOUS =
       AttributeKey.booleanKey("messaging.destination.anonymous");
 
-  static Attributes build(SpanData span) {
+  static Attributes build(SpanData span, boolean includeSpanName) {
     AttributesBuilder builder =
         Attributes.builder()
-            .put(SPAN_NAME, span.getName())
             .put(SPAN_KIND, span.getKind().name())
-            .put(STATUS_CODE, span.getStatus().getStatusCode().name())
             // Schema + library-version markers appear on both spans and metrics (spec §6).
             .put(SpanMetricsProcessor.SCHEMA_ATTR, SpanMetricsProcessor.SCHEMA_VERSION)
             .put(SpanMetricsProcessor.LIB_VERSION_ATTR, SpanMetricsProcessor.LIB_VERSION);
+    if (includeSpanName) {
+      builder.put(SPAN_NAME, span.getName());
+    }
+    // otel.status_code is only OK or ERROR; it MUST NOT be set when the status is UNSET.
+    StatusCode statusCode = span.getStatus().getStatusCode();
+    if (statusCode != StatusCode.UNSET) {
+      builder.put(STATUS_CODE, statusCode.name());
+    }
 
     // service.name is deliberately NOT a datapoint attribute: the metrics are recorded into the
     // host SDK's MeterProvider, whose resource already carries service.name, so duplicating it on
@@ -155,6 +166,11 @@ final class SpanMetricsAttributesBuilder {
         spanAttributes,
         span.getKind() == SpanKind.SERVER ? SERVER_SPAN_PEER_FALLBACKS : PEER_FALLBACKS);
     copyDestinationIfNamed(builder, spanAttributes);
+    // A failed operation always carries error.type: the span's own value (copied above via the
+    // allowlist) wins, otherwise the semconv _OTHER fallback.
+    if (statusCode == StatusCode.ERROR && spanAttributes.get(ERROR_TYPE) == null) {
+      builder.put(ERROR_TYPE, ERROR_TYPE_OTHER);
+    }
     return builder.build();
   }
 

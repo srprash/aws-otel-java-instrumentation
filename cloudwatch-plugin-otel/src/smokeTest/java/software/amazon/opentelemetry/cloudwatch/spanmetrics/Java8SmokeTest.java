@@ -56,11 +56,10 @@ public final class Java8SmokeTest {
 
     meterProvider.forceFlush().join(10, java.util.concurrent.TimeUnit.SECONDS);
     Collection<MetricData> metrics = exporter.getFinishedMetricItems();
-    boolean sawCalls =
-        metrics.stream().anyMatch(m -> "traces.span.metrics.calls".equals(m.getName()));
-    if (!sawCalls) {
+    boolean sawDuration = metrics.stream().anyMatch(m -> "otel.span.duration".equals(m.getName()));
+    if (!sawDuration) {
       throw new IllegalStateException(
-          "Java 8 smoke test failed: calls metric not produced; metrics=" + metrics);
+          "Java 8 smoke test failed: otel.span.duration metric not produced; metrics=" + metrics);
     }
     System.out.println("Java 8 smoke test passed on " + System.getProperty("java.version"));
   }

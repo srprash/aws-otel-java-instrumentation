@@ -102,6 +102,6 @@ class NoMetricsPipelineTest {
 
     meterProvider.forceFlush().join(10, TimeUnit.SECONDS);
     Collection<MetricData> metrics = exporter.getFinishedMetricItems();
-    assertThat(metrics).anyMatch(m -> "traces.span.metrics.calls".equals(m.getName()));
+    assertThat(metrics).anyMatch(m -> "otel.span.duration".equals(m.getName()));
   }
 }

@@ -36,12 +36,18 @@ import software.amazon.opentelemetry.cloudwatch.spanmetrics.SpanMetricsProcessor
 public final class SpanMetricsCustomizerProvider
     implements AutoConfigurationCustomizerProvider, AutoConfigureListener {
 
+  static final String SPAN_NAME_ENABLED_PROPERTY = "otel.span.metrics.span_name.enabled";
+
   @Override
   public void customize(AutoConfigurationCustomizer autoConfiguration) {
     autoConfiguration.addSamplerCustomizer(
         (sampler, config) -> AlwaysRecordSampler.create(sampler));
     autoConfiguration.addTracerProviderCustomizer(
-        (tracerProvider, config) -> tracerProvider.addSpanProcessor(new SpanMetricsProcessor()));
+        (tracerProvider, config) ->
+            tracerProvider.addSpanProcessor(
+                // PROTOTYPE: Opt-In otel.span.name (system property or
+                // OTEL_SPAN_METRICS_SPAN_NAME_ENABLED env var).
+                new SpanMetricsProcessor(config.getBoolean(SPAN_NAME_ENABLED_PROPERTY, false))));
   }
 
   @Override

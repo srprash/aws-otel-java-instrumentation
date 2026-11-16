@@ -18,7 +18,6 @@ package software.amazon.opentelemetry.cloudwatch.spanmetrics;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
 import io.opentelemetry.api.metrics.Meter;
 import io.opentelemetry.api.metrics.MeterProvider;
 import io.opentelemetry.context.Context;
@@ -33,10 +32,14 @@ import java.util.logging.Logger;
 import software.amazon.opentelemetry.cloudwatch.spanmetrics.internal.OpenTelemetryHolder;
 
 /**
- * Generates request metrics from every recorded span, using the SpanMetricsConnector metric names
- * and dimensions. Paired with {@link AlwaysRecordSampler}, it sees 100% of spans regardless of the
- * trace sampling rate. It also stamps identity/dedup attributes (§6 of the spec) on each span at
- * start, so the backend can skip regenerating metrics from a span the extension already metered.
+ * Generates request metrics from every recorded span. Paired with {@link AlwaysRecordSampler}, it
+ * sees 100% of spans regardless of the trace sampling rate. It also stamps identity/dedup
+ * attributes (§6 of the spec) on each span at start, so the backend can skip regenerating metrics
+ * from a span the extension already metered.
+ *
+ * <p>PROTOTYPE: emits the shape proposed for OpenTelemetry semantic conventions (one {@code
+ * otel.span.duration} histogram; see open-telemetry/semantic-conventions#4240) instead of the
+ * SpanMetricsConnector names. Not for release.
  */
 public final class SpanMetricsProcessor implements SpanProcessor {
 
@@ -61,14 +64,16 @@ public final class SpanMetricsProcessor implements SpanProcessor {
   static final io.opentelemetry.api.common.AttributeKey<String> LIB_VERSION_ATTR =
       io.opentelemetry.api.common.AttributeKey.stringKey("aws.otel.extension.lib.version");
 
-  private static final String CALLS_METRIC = "traces.span.metrics.calls";
-  private static final String DURATION_METRIC = "traces.span.metrics.duration";
+  // A single histogram: throughput is its count and error rate is the count with error.type, per
+  // the semconv guidance for operation duration metrics. There is no separate calls counter.
+  private static final String DURATION_METRIC = "otel.span.duration";
+  private static final String DURATION_DESCRIPTION =
+      "Duration of ended spans, derived from span start and end timestamps.";
 
-  // SpanMetricsConnector default boundaries expressed in seconds (spec §1).
+  // Semconv duration histogram bucket guidance (1, 2.5, 5 subdivisions up to 10s, then 30s, 60s).
   private static final List<Double> DURATION_BUCKETS_SECONDS =
       Arrays.asList(
-          0.002, 0.004, 0.006, 0.008, 0.01, 0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.4, 2.0, 5.0, 10.0,
-          15.0);
+          0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0);
 
   private static final double NANOS_PER_SECOND = 1_000_000_000.0;
 
@@ -76,9 +81,26 @@ public final class SpanMetricsProcessor implements SpanProcessor {
   private static final Class<? extends Meter> NOOP_METER_CLASS =
       MeterProvider.noop().get(SCOPE_NAME).getClass();
 
+  // otel.span.name is Opt-In in the proposed convention because span names can be high
+  // cardinality.
+  private final boolean includeSpanName;
+
   // Initialized on the first onEnd() once the host has supplied a recording MeterProvider.
-  private volatile LongCounter calls;
   private volatile DoubleHistogram duration;
+
+  /** Creates a processor that omits {@code otel.span.name} from metric attributes. */
+  public SpanMetricsProcessor() {
+    this(false);
+  }
+
+  /**
+   * Creates a processor.
+   *
+   * @param includeSpanName whether to record the Opt-In {@code otel.span.name} metric attribute
+   */
+  public SpanMetricsProcessor(boolean includeSpanName) {
+    this.includeSpanName = includeSpanName;
+  }
 
   @Override
   public void onStart(Context parentContext, ReadWriteSpan span) {
@@ -115,9 +137,9 @@ public final class SpanMetricsProcessor implements SpanProcessor {
       // off the concrete SdkSpan would break non-SDK ReadableSpan implementations). Everything else
       // is read from this single snapshot.
       SpanData data = span.toSpanData();
-      Attributes attributes = SpanMetricsAttributesBuilder.build(data);
-      calls.add(1, attributes);
-      long nanos = data.getEndEpochNanos() - data.getStartEpochNanos();
+      Attributes attributes = SpanMetricsAttributesBuilder.build(data, includeSpanName);
+      // An end timestamp earlier than the start records 0, so the span is still counted.
+      long nanos = Math.max(0L, data.getEndEpochNanos() - data.getStartEpochNanos());
       duration.record(nanos / NANOS_PER_SECOND, attributes);
     } catch (RuntimeException e) {
       logger.log(Level.WARNING, "Failed to record span metrics", e);
@@ -130,11 +152,11 @@ public final class SpanMetricsProcessor implements SpanProcessor {
   }
 
   private boolean ensureInstruments() {
-    if (calls != null) {
+    if (duration != null) {
       return true;
     }
     synchronized (this) {
-      if (calls != null) {
+      if (duration != null) {
         return true;
       }
       OpenTelemetry openTelemetry = OpenTelemetryHolder.get();
@@ -154,13 +176,10 @@ public final class SpanMetricsProcessor implements SpanProcessor {
       duration =
           meter
               .histogramBuilder(DURATION_METRIC)
+              .setDescription(DURATION_DESCRIPTION)
               .setUnit("s")
               .setExplicitBucketBoundariesAdvice(DURATION_BUCKETS_SECONDS)
               .build();
-      // {call} is the UCUM annotation for counted things, matching OTel semconv counter
-      // conventions (cf. {request}, {operation}). The collector spanmetrics connector leaves the
-      // unit unset; the annotation is preferred because it states what is being counted.
-      calls = meter.counterBuilder(CALLS_METRIC).setUnit("{call}").build();
     }
     return true;
   }

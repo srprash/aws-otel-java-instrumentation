@@ -54,6 +54,11 @@ class SpanMetricsProcessorTest {
   }
 
   private static ReadableSpan readableSpan(SpanKind kind, StatusData status, Attributes attrs) {
+    return readableSpan(kind, status, attrs, 0, 5_000_000); // 5 ms
+  }
+
+  private static ReadableSpan readableSpan(
+      SpanKind kind, StatusData status, Attributes attrs, long startNanos, long endNanos) {
     SpanData data =
         TestSpanData.builder()
             .setName("op")
@@ -68,8 +73,8 @@ class SpanMetricsProcessorTest {
                     "0000000000000001",
                     TraceFlags.getDefault(),
                     TraceState.getDefault()))
-            .setStartEpochNanos(0)
-            .setEndEpochNanos(5_000_000) // 5 ms
+            .setStartEpochNanos(startNanos)
+            .setEndEpochNanos(endNanos)
             .setHasEnded(true)
             .build();
     ReadableSpan span = Mockito.mock(ReadableSpan.class);
@@ -78,45 +83,34 @@ class SpanMetricsProcessorTest {
   }
 
   @Test
-  void emitsCallsAndDurationWithExpectedShape() {
+  void emitsSingleDurationHistogramWithSemconvShape() {
     processor.onEnd(readableSpan(SpanKind.SERVER, StatusData.unset(), Attributes.empty()));
 
     Collection<MetricData> metrics = reader.collectAllMetrics();
-    MetricData calls =
-        metrics.stream()
-            .filter(m -> m.getName().equals("traces.span.metrics.calls"))
-            .findFirst()
-            .orElseThrow(() -> new AssertionError("calls metric missing"));
-    MetricData duration =
-        metrics.stream()
-            .filter(m -> m.getName().equals("traces.span.metrics.duration"))
-            .findFirst()
-            .orElseThrow(() -> new AssertionError("duration metric missing"));
+    // One histogram only: the connector-era calls counter is gone.
+    assertThat(metrics).noneMatch(m -> m.getName().startsWith("traces.span.metrics."));
+    MetricData duration = durationMetric(metrics);
 
-    // Duration is in seconds; a 5ms span records 0.005s, with the connector default buckets.
+    // Duration is in seconds; a 5ms span records 0.005s, with the semconv bucket guidance.
     assertThat(duration.getUnit()).isEqualTo("s");
+    assertThat(duration.getDescription())
+        .isEqualTo("Duration of ended spans, derived from span start and end timestamps.");
     assertThat(duration.getHistogramData().getPoints())
         .anySatisfy(
             p -> {
+              assertThat(p.getCount()).isEqualTo(1);
               assertThat(p.getSum()).isEqualTo(0.005);
               assertThat(p.getBoundaries())
                   .containsExactly(
-                      0.002, 0.004, 0.006, 0.008, 0.01, 0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.4, 2.0,
-                      5.0, 10.0, 15.0);
-            });
-
-    // calls is a monotonic Sum with the {call} UCUM annotation unit.
-    assertThat(calls.getUnit()).isEqualTo("{call}");
-    assertThat(calls.getLongSumData().isMonotonic()).isTrue();
-    assertThat(calls.getLongSumData().getPoints())
-        .anySatisfy(
-            p -> {
-              assertThat(p.getValue()).isEqualTo(1);
-              // Short-form base attribute values.
-              assertThat(p.getAttributes().get(AttributeKey.stringKey("span.kind")))
+                      0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+                      30.0, 60.0);
+              assertThat(p.getAttributes().get(AttributeKey.stringKey("otel.span.kind")))
                   .isEqualTo("SERVER");
-              assertThat(p.getAttributes().get(AttributeKey.stringKey("status.code")))
-                  .isEqualTo("UNSET");
+              // UNSET status: no otel.status_code, no error.type, and span name is Opt-In.
+              assertThat(p.getAttributes().get(AttributeKey.stringKey("otel.status_code")))
+                  .isNull();
+              assertThat(p.getAttributes().get(AttributeKey.stringKey("error.type"))).isNull();
+              assertThat(p.getAttributes().get(AttributeKey.stringKey("otel.span.name"))).isNull();
               // Schema + lib-version markers on the metric (spec §6).
               assertThat(
                       p.getAttributes().get(AttributeKey.stringKey("aws.otel.span.metrics.schema")))
@@ -125,6 +119,46 @@ class SpanMetricsProcessorTest {
                       p.getAttributes()
                           .get(AttributeKey.stringKey("aws.otel.extension.lib.version")))
                   .isEqualTo(SpanMetricsProcessor.LIB_VERSION);
+            });
+  }
+
+  @Test
+  void spanNameRecordedWhenOptedIn() {
+    new SpanMetricsProcessor(true)
+        .onEnd(
+            readableSpan(
+                SpanKind.INTERNAL,
+                StatusData.unset(),
+                Attributes.builder().put("http.route", "/opt-in").build()));
+
+    assertThat(durationMetric(reader.collectAllMetrics()).getHistogramData().getPoints())
+        .filteredOn(
+            p -> "/opt-in".equals(p.getAttributes().get(AttributeKey.stringKey("http.route"))))
+        .singleElement()
+        .satisfies(
+            p ->
+                assertThat(p.getAttributes().get(AttributeKey.stringKey("otel.span.name")))
+                    .isEqualTo("op"));
+  }
+
+  @Test
+  void endBeforeStartRecordsZeroAndIsCounted() {
+    processor.onEnd(
+        readableSpan(
+            SpanKind.INTERNAL,
+            StatusData.unset(),
+            Attributes.builder().put("http.route", "/clock-skew").build(),
+            10_000_000,
+            5_000_000));
+
+    assertThat(durationMetric(reader.collectAllMetrics()).getHistogramData().getPoints())
+        .filteredOn(
+            p -> "/clock-skew".equals(p.getAttributes().get(AttributeKey.stringKey("http.route"))))
+        .singleElement()
+        .satisfies(
+            p -> {
+              assertThat(p.getCount()).isEqualTo(1);
+              assertThat(p.getSum()).isEqualTo(0.0);
             });
   }
 
@@ -146,23 +180,25 @@ class SpanMetricsProcessorTest {
                   .build()));
     }
 
-    MetricData calls =
-        reader.collectAllMetrics().stream()
-            .filter(m -> m.getName().equals("traces.span.metrics.calls"))
-            .findFirst()
-            .orElseThrow(() -> new AssertionError("calls metric missing"));
-    assertThat(calls.getLongSumData().getPoints())
+    assertThat(durationMetric(reader.collectAllMetrics()).getHistogramData().getPoints())
         .filteredOn(
             p -> "/items/{id}".equals(p.getAttributes().get(AttributeKey.stringKey("http.route"))))
         .singleElement()
         .satisfies(
             p -> {
-              assertThat(p.getValue()).isEqualTo(3);
+              assertThat(p.getCount()).isEqualTo(3);
               assertThat(p.getAttributes().get(AttributeKey.longKey("net.peer.port"))).isNull();
               assertThat(p.getAttributes().get(AttributeKey.stringKey("net.peer.name"))).isNull();
               assertThat(p.getAttributes().get(AttributeKey.longKey("net.host.port")))
                   .isEqualTo(8080L);
             });
+  }
+
+  private static MetricData durationMetric(Collection<MetricData> metrics) {
+    return metrics.stream()
+        .filter(m -> m.getName().equals("otel.span.duration"))
+        .findFirst()
+        .orElseThrow(() -> new AssertionError("otel.span.duration metric missing"));
   }
 
   @Test

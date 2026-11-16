@@ -51,15 +51,70 @@ class SpanMetricsAttributesBuilderTest {
   }
 
   @Test
-  void baseAttributesUseShortForms() {
+  void baseAttributesUseSemconvKeysAndApiNames() {
     Attributes attrs =
         SpanMetricsAttributesBuilder.build(
             span(SpanKind.SERVER, Attributes.empty())
                 .setStatus(StatusData.create(StatusCode.ERROR, ""))
-                .build());
-    assertThat(attrs.get(AttributeKey.stringKey("span.name"))).isEqualTo("op");
-    assertThat(attrs.get(AttributeKey.stringKey("span.kind"))).isEqualTo("SERVER");
-    assertThat(attrs.get(AttributeKey.stringKey("status.code"))).isEqualTo("ERROR");
+                .build(),
+            false);
+    assertThat(attrs.get(AttributeKey.stringKey("otel.span.kind"))).isEqualTo("SERVER");
+    assertThat(attrs.get(AttributeKey.stringKey("otel.status_code"))).isEqualTo("ERROR");
+    // The connector-era keys are gone.
+    assertThat(attrs.get(AttributeKey.stringKey("span.kind"))).isNull();
+    assertThat(attrs.get(AttributeKey.stringKey("status.code"))).isNull();
+  }
+
+  @Test
+  void spanNameIsOptIn() {
+    Attributes off =
+        SpanMetricsAttributesBuilder.build(
+            span(SpanKind.SERVER, Attributes.empty()).build(), false);
+    assertThat(off.get(AttributeKey.stringKey("otel.span.name"))).isNull();
+
+    Attributes on =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, Attributes.empty()).build(), true);
+    assertThat(on.get(AttributeKey.stringKey("otel.span.name"))).isEqualTo("op");
+  }
+
+  @Test
+  void statusCodeOmittedWhenUnset() {
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(
+            span(SpanKind.CLIENT, Attributes.empty()).setStatus(StatusData.unset()).build(), false);
+    assertThat(attrs.get(AttributeKey.stringKey("otel.status_code"))).isNull();
+    assertThat(attrs.get(AttributeKey.stringKey("error.type"))).isNull();
+  }
+
+  @Test
+  void statusOkRecordedWithoutErrorType() {
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(
+            span(SpanKind.CLIENT, Attributes.empty()).setStatus(StatusData.ok()).build(), false);
+    assertThat(attrs.get(AttributeKey.stringKey("otel.status_code"))).isEqualTo("OK");
+    assertThat(attrs.get(AttributeKey.stringKey("error.type"))).isNull();
+  }
+
+  @Test
+  void errorWithoutErrorTypeFallsBackToOther() {
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(
+            span(SpanKind.SERVER, Attributes.empty())
+                .setStatus(StatusData.create(StatusCode.ERROR, "boom"))
+                .build(),
+            false);
+    assertThat(attrs.get(AttributeKey.stringKey("error.type"))).isEqualTo("_OTHER");
+  }
+
+  @Test
+  void errorTypeFromSpanWinsOverFallback() {
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(
+            span(SpanKind.SERVER, Attributes.builder().put("error.type", "500").build())
+                .setStatus(StatusData.create(StatusCode.ERROR, ""))
+                .build(),
+            false);
+    assertThat(attrs.get(AttributeKey.stringKey("error.type"))).isEqualTo("500");
   }
 
   @Test
@@ -67,11 +122,13 @@ class SpanMetricsAttributesBuilderTest {
     // service.name lives on the metric's resource (the host MeterProvider's resource), so the
     // datapoint must not duplicate it — even when the span's resource carries it.
     Attributes withResource =
-        SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, Attributes.empty()).build());
+        SpanMetricsAttributesBuilder.build(
+            span(SpanKind.SERVER, Attributes.empty()).build(), false);
     assertThat(withResource.get(AttributeKey.stringKey("service.name"))).isNull();
     Attributes withoutResource =
         SpanMetricsAttributesBuilder.build(
-            span(SpanKind.INTERNAL, Attributes.empty()).setResource(Resource.empty()).build());
+            span(SpanKind.INTERNAL, Attributes.empty()).setResource(Resource.empty()).build(),
+            false);
     assertThat(withoutResource.get(AttributeKey.stringKey("service.name"))).isNull();
   }
 
@@ -84,7 +141,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("http.route", "/vets")
             .put("url.query", "x=1") // not allowlisted
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("http.request.method"))).isEqualTo("GET");
     assertThat(attrs.get(AttributeKey.longKey("http.response.status_code"))).isEqualTo(200L);
     assertThat(attrs.get(AttributeKey.stringKey("http.route"))).isEqualTo("/vets");
@@ -101,7 +159,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("error.type", "UNAVAILABLE")
             .put("rpc.request.body", "secret") // not allowlisted
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("rpc.system.name"))).isEqualTo("grpc");
     assertThat(attrs.get(AttributeKey.stringKey("rpc.service"))).isEqualTo("orders.OrderService");
     assertThat(attrs.get(AttributeKey.stringKey("rpc.method"))).isEqualTo("GetOrder");
@@ -114,7 +173,8 @@ class SpanMetricsAttributesBuilderTest {
     // Instrumentation still emitting rpc.system (legacy): pass it through unchanged under its own
     // key; do not re-home it under rpc.system.name.
     Attributes span = Attributes.builder().put("rpc.system", "grpc").build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("rpc.system"))).isEqualTo("grpc");
     assertThat(attrs.get(AttributeKey.stringKey("rpc.system.name"))).isNull();
   }
@@ -123,7 +183,8 @@ class SpanMetricsAttributesBuilderTest {
   void currentRpcSystemNameWinsOverLegacy() {
     Attributes span =
         Attributes.builder().put("rpc.system.name", "grpc").put("rpc.system", "legacy").build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("rpc.system.name"))).isEqualTo("grpc");
     assertThat(attrs.get(AttributeKey.stringKey("rpc.system"))).isNull();
   }
@@ -134,7 +195,8 @@ class SpanMetricsAttributesBuilderTest {
     // translation and no current-key emission. http.status_code stays a long.
     Attributes span =
         Attributes.builder().put("http.method", "POST").put("http.status_code", 404L).build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("http.method"))).isEqualTo("POST");
     assertThat(attrs.get(AttributeKey.longKey("http.status_code"))).isEqualTo(404L);
     assertThat(attrs.get(AttributeKey.stringKey("http.request.method"))).isNull();
@@ -150,7 +212,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("http.response.status_code", 200L)
             .put("http.status_code", 500L)
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("http.request.method"))).isEqualTo("GET");
     assertThat(attrs.get(AttributeKey.longKey("http.response.status_code"))).isEqualTo(200L);
     // Legacy keys not added when the current keys are present.
@@ -166,7 +229,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("db.operation.name", "SELECT")
             .put("db.collection.name", "vets")
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("db.system.name"))).isEqualTo("postgresql");
     assertThat(attrs.get(AttributeKey.stringKey("db.operation.name"))).isEqualTo("SELECT");
     assertThat(attrs.get(AttributeKey.stringKey("db.collection.name"))).isEqualTo("vets");
@@ -182,7 +246,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("db.operation", "SELECT")
             .put("db.sql.table", "orders")
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("db.system"))).isEqualTo("mssql");
     assertThat(attrs.get(AttributeKey.stringKey("db.operation"))).isEqualTo("SELECT");
     assertThat(attrs.get(AttributeKey.stringKey("db.sql.table"))).isEqualTo("orders");
@@ -194,7 +259,8 @@ class SpanMetricsAttributesBuilderTest {
   void currentKeyWinsAndLegacyIgnoredWhenBothPresent() {
     Attributes span =
         Attributes.builder().put("db.system.name", "postgresql").put("db.system", "h2").build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("db.system.name"))).isEqualTo("postgresql");
     // Legacy key not added when the current key is present.
     assertThat(attrs.get(AttributeKey.stringKey("db.system"))).isNull();
@@ -203,7 +269,8 @@ class SpanMetricsAttributesBuilderTest {
   @Test
   void schemaAndLibVersionAlwaysPresent() {
     Attributes attrs =
-        SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, Attributes.empty()).build());
+        SpanMetricsAttributesBuilder.build(
+            span(SpanKind.SERVER, Attributes.empty()).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("aws.otel.span.metrics.schema"))).isEqualTo("v1");
     // A real version, not the constant itself: comparing to LIB_VERSION would pass even if
     // resolution broke (it once shipped as "unknown" in javaagent mode).
@@ -218,7 +285,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("messaging.system", "kafka")
             .put("messaging.destination.name", "orders")
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CONSUMER, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CONSUMER, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("messaging.destination.name"))).isEqualTo("orders");
   }
 
@@ -230,7 +298,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("messaging.destination.name", "temp-abc123")
             .put("messaging.destination.temporary", true)
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.PRODUCER, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.PRODUCER, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("messaging.destination.name"))).isNull();
     assertThat(attrs.get(AttributeKey.stringKey("messaging.system"))).isEqualTo("jms");
   }
@@ -242,7 +311,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("messaging.destination.name", "amq.gen-xyz")
             .put("messaging.destination.anonymous", true)
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CONSUMER, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CONSUMER, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("messaging.destination.name"))).isNull();
   }
 
@@ -254,7 +324,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("messaging.operation.type", "receive")
             .put("messaging.consumer.group.name", "order-processors")
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CONSUMER, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CONSUMER, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("messaging.operation.type"))).isEqualTo("receive");
     assertThat(attrs.get(AttributeKey.stringKey("messaging.consumer.group.name")))
         .isEqualTo("order-processors");
@@ -268,7 +339,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("server.port", 8443L)
             .put("network.peer.address", "10.0.0.1") // not allowlisted
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("server.address")))
         .isEqualTo("payments.example.com");
     // server.port is an int per semconv (emitted as a long attribute), not a string dimension.
@@ -286,7 +358,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("net.peer.name", "payments.example.com")
             .put("net.peer.port", 8443L)
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("net.peer.name")))
         .isEqualTo("payments.example.com");
     assertThat(attrs.get(AttributeKey.longKey("net.peer.port"))).isEqualTo(8443L);
@@ -302,7 +375,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("net.host.name", "api.example.com")
             .put("net.host.port", 443L)
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("net.host.name"))).isEqualTo("api.example.com");
     assertThat(attrs.get(AttributeKey.longKey("net.host.port"))).isEqualTo(443L);
     assertThat(attrs.get(AttributeKey.stringKey("server.address"))).isNull();
@@ -316,7 +390,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("net.peer.name", "legacy.example.com")
             .put("net.host.name", "legacy-host.example.com")
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("server.address")))
         .isEqualTo("current.example.com");
     // No legacy key added when the current key is present.
@@ -335,7 +410,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("net.host.name", "payments.example.com")
             .put("net.host.port", 8443L)
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("net.host.name")))
         .isEqualTo("payments.example.com");
     assertThat(attrs.get(AttributeKey.longKey("net.host.port"))).isEqualTo(8443L);
@@ -352,7 +428,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("net.peer.name", "client.example.com")
             .put("net.peer.port", 54321L)
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.SERVER, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("net.peer.name"))).isNull();
     assertThat(attrs.get(AttributeKey.longKey("net.peer.port"))).isNull();
     assertThat(attrs.get(AttributeKey.stringKey("net.host.name"))).isNull();
@@ -373,7 +450,7 @@ class SpanMetricsAttributesBuilderTest {
             .build();
     for (SpanKind kind :
         new SpanKind[] {SpanKind.CLIENT, SpanKind.PRODUCER, SpanKind.CONSUMER, SpanKind.INTERNAL}) {
-      Attributes attrs = SpanMetricsAttributesBuilder.build(span(kind, span).build());
+      Attributes attrs = SpanMetricsAttributesBuilder.build(span(kind, span).build(), false);
       assertThat(attrs.get(AttributeKey.stringKey("net.peer.name")))
           .as(kind.name())
           .isEqualTo("payments.example.com");
@@ -395,7 +472,7 @@ class SpanMetricsAttributesBuilderTest {
             .put("net.host.port", 8080L)
             .build();
     for (SpanKind kind : new SpanKind[] {SpanKind.SERVER, SpanKind.CLIENT}) {
-      Attributes attrs = SpanMetricsAttributesBuilder.build(span(kind, span).build());
+      Attributes attrs = SpanMetricsAttributesBuilder.build(span(kind, span).build(), false);
       assertThat(attrs.get(AttributeKey.stringKey("server.address")))
           .as(kind.name())
           .isEqualTo("payments.example.com");
@@ -415,7 +492,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("gen_ai.provider.name", "aws.bedrock")
             .put("gen_ai.operation.name", "chat")
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("gen_ai.request.model")))
         .isEqualTo("claude-sonnet-4");
     assertThat(attrs.get(AttributeKey.stringKey("gen_ai.provider.name"))).isEqualTo("aws.bedrock");
@@ -433,7 +511,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("aws.sns.topic.arn", "arn:aws:sns:us-east-1:123:topic")
             .put("aws.sqs.queue.url", "https://sqs.us-east-1.amazonaws.com/123/queue")
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("aws.s3.bucket"))).isEqualTo("my-bucket");
     // table_names stays a string array per semconv; copied through unchanged, not normalized.
     assertThat(attrs.get(AttributeKey.stringArrayKey("aws.dynamodb.table_names")))
@@ -455,7 +534,8 @@ class SpanMetricsAttributesBuilderTest {
             .put("faas.invoked_region", "us-east-1")
             .put("faas.trigger", "http")
             .build();
-    Attributes attrs = SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build());
+    Attributes attrs =
+        SpanMetricsAttributesBuilder.build(span(SpanKind.CLIENT, span).build(), false);
     assertThat(attrs.get(AttributeKey.stringKey("faas.invoked_name"))).isEqualTo("my-function");
     assertThat(attrs.get(AttributeKey.stringKey("faas.invoked_provider"))).isEqualTo("aws");
     assertThat(attrs.get(AttributeKey.stringKey("faas.invoked_region"))).isEqualTo("us-east-1");
